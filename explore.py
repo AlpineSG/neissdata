@@ -27,11 +27,26 @@ def q(sql, params=None):
     return con.execute(sql, params or []).df()
 
 
-def product_label():
+def label(variable, expr):
+    """SQL that turns a coded column into its label, falling back to the raw code."""
     if has_codes:
-        return ("coalesce((SELECT label FROM codes WHERE variable = 'product' "
-                "AND code = cp.product), cp.product::VARCHAR)")
-    return "cp.product::VARCHAR"
+        return (f"coalesce((SELECT label FROM codes WHERE variable = '{variable}' "
+                f"AND code = {expr}), {expr}::VARCHAR)")
+    return f"{expr}::VARCHAR"
+
+
+# All products on a case, in recorded order, as one readable string.
+PRODUCTS_FOR_CASE = f"""(
+    SELECT string_agg({label('product', 'cp.product')}, ' | ' ORDER BY cp.position)
+    FROM case_products cp WHERE cp.case_id = c.case_id)"""
+
+
+@st.cache_data
+def product_options():
+    """Every product code in the data with its label, most common first."""
+    df = q(f"""SELECT cp.product AS code, {label('product', 'cp.product')} AS label, count(*) AS n
+               FROM case_products cp GROUP BY 1, 2 ORDER BY n DESC""")
+    return {int(r.code): f"{r.label} ({r.code}) · {r.n:,}" for r in df.itertuples()}
 
 
 # ---- Filters ----------------------------------------------------------------
@@ -40,8 +55,9 @@ years = q("SELECT DISTINCT year(treatment_date) AS y FROM cases ORDER BY 1")["y"
 year_range = st.sidebar.select_slider("Years", options=years, value=(years[0], years[-1]))
 ages = st.sidebar.multiselect("Age groups", AGE_ORDER, default=AGE_ORDER)
 keyword = st.sidebar.text_input("Narrative contains", placeholder="e.g. SWING").strip().upper()
-codes_text = st.sidebar.text_input("Product codes (comma separated)", placeholder="e.g. 1555")
-codes = [int(c) for c in codes_text.replace(" ", "").split(",") if c.isdigit()]
+prod_opts = product_options()
+codes = st.sidebar.multiselect("Products", list(prod_opts), format_func=prod_opts.get,
+                               placeholder="Type to search, e.g. high chair")
 
 where = ["year(c.treatment_date) BETWEEN ? AND ?", "list_contains(?, c.age_group)"]
 params = [year_range[0], year_range[1], ages]
@@ -76,15 +92,24 @@ right.subheader("Estimate by age group")
 right.bar_chart(by_age.set_index("age_group").reindex(AGE_ORDER).dropna(), y="estimate")
 
 st.subheader("Top products")
-top = q(f"""SELECT {product_label()} AS product, count(*) AS cases, round(sum(c.weight)) AS estimate
-           FROM cases c JOIN case_products cp USING (case_id)
-           WHERE {WHERE} GROUP BY 1 ORDER BY estimate DESC LIMIT 15""", params)
+st.caption("A case can involve up to three products, so these counts add up to more than the case total.")
+top = q(f"""SELECT cp.product AS code, {label('product', 'cp.product')} AS product,
+                   count(*) AS cases, round(sum(c.weight)) AS estimate
+            FROM cases c JOIN case_products cp USING (case_id)
+            WHERE {WHERE} GROUP BY 1, 2 ORDER BY estimate DESC LIMIT 15""", params)
 st.dataframe(top, hide_index=True, width='stretch')
 
 st.subheader("Narratives")
-st.dataframe(q(f"""SELECT treatment_date, age_group, narrative, round(weight, 1) AS weight
-                  FROM cases c WHERE {WHERE} ORDER BY treatment_date DESC LIMIT 500""", params),
-             hide_index=True, width='stretch')
+st.dataframe(q(f"""SELECT c.treatment_date, c.age_group,
+                          {PRODUCTS_FOR_CASE} AS products,
+                          {label('body_part', 'c.body_part')} AS body_part,
+                          {label('diagnosis', 'c.diagnosis')} AS diagnosis,
+                          {label('disposition', 'c.disposition')} AS disposition,
+                          c.narrative, round(c.weight, 1) AS weight
+                   FROM cases c WHERE {WHERE}
+                   ORDER BY c.treatment_date DESC LIMIT 500""", params),
+             hide_index=True, width='stretch',
+             column_config={"narrative": st.column_config.TextColumn(width="large")})
 
 # ---- Free SQL ---------------------------------------------------------------
 with st.expander("Run your own SQL"):
